@@ -55,6 +55,7 @@ import { data, isRouteErrorResponse } from "react-router";
 import { z } from "zod";
 import { COUNTRIES } from "~/lib/ppp";
 import { parseFormData, parseParams } from "~/lib/validation";
+import { recordCourseCompletion } from "~/lib/course-completion.server";
 
 const lessonParamsSchema = z.object({
   slug: z.string().min(1),
@@ -946,6 +947,7 @@ export async function action({ params, request }: Route.ActionArgs) {
 
   if (intent === "mark-complete") {
     markLessonComplete(currentUserId, lessonId);
+    recordCourseCompletion(currentUserId, course.id);
     return { success: true };
   }
 
