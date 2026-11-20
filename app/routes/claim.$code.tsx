@@ -2,7 +2,7 @@ import { Link, useFetcher, redirect } from "react-router";
 import { useEffect } from "react";
 import { toast } from "sonner";
 import { z } from "zod";
-import type { Route } from "./+types/redeem.$code";
+import type { Route } from "./+types/claim.$code";
 import { getCurrentUserId } from "~/lib/session";
 import { resolveCountry } from "~/lib/country.server";
 import { parseParams, parseFormData } from "~/lib/validation";
@@ -11,15 +11,16 @@ import { Button } from "~/components/ui/button";
 import { Ticket, AlertCircle, CheckCircle2, Globe } from "lucide-react";
 import { data } from "react-router";
 import { db } from "~/db";
-import { purchases, coupons, courses, enrollments } from "~/db/schema";
+import { purchases, seats, courses, enrollments } from "~/db/schema";
+import { checkPppAccess } from "~/lib/ppp";
 import { eq, and } from "drizzle-orm";
 
 function getCourseById(id: number) {
   return db.select().from(courses).where(eq(courses.id, id)).get();
 }
 
-function getCouponByCode(code: string) {
-  return db.select().from(coupons).where(eq(coupons.code, code)).get();
+function getSeatByCode(code: string) {
+  return db.select().from(seats).where(eq(seats.code, code)).get();
 }
 
 function isUserEnrolled(userId: number, courseId: number) {
@@ -34,134 +35,133 @@ function isUserEnrolled(userId: number, courseId: number) {
   return !!existing;
 }
 
-type RedeemResult =
-  | { ok: true; enrollment: typeof enrollments.$inferSelect }
-  | { ok: false; error: string };
-
-function redeemCoupon(
-  code: string,
-  userId: number,
-  userCountry: string
-): RedeemResult {
-  const coupon = getCouponByCode(code);
-  if (!coupon) {
-    return { ok: false, error: "Coupon not found" };
-  }
-
-  if (coupon.redeemedByUserId !== null) {
-    return { ok: false, error: "Coupon has already been redeemed" };
-  }
-
-  const existingEnrollment = db
-    .select()
-    .from(enrollments)
-    .where(
-      and(
-        eq(enrollments.userId, userId),
-        eq(enrollments.courseId, coupon.courseId)
-      )
-    )
-    .get();
-
-  if (existingEnrollment) {
-    return { ok: false, error: "You are already enrolled in this course" };
-  }
-
+/**
+ * The PPP Lock applies to Seats as it does to the Buyer: Seats bought at a
+ * PPP discount can only be Claimed from the country they were bought in.
+ */
+function isSeatPppLocked(
+  seat: typeof seats.$inferSelect,
+  userCountry: string | null
+) {
+  const course = getCourseById(seat.courseId);
   const purchase = db
     .select()
     .from(purchases)
-    .where(eq(purchases.id, coupon.purchaseId))
+    .where(eq(purchases.id, seat.purchaseId))
     .get();
+  if (!course || !purchase) return false;
 
-  if (purchase?.country && purchase.country !== userCountry) {
+  return checkPppAccess(
+    course.price,
+    course.pppEnabled,
+    purchase.country,
+    userCountry
+  ).blocked;
+}
+
+type ClaimResult =
+  | { ok: true; enrollment: typeof enrollments.$inferSelect }
+  | { ok: false; error: string };
+
+function claimSeat(
+  code: string,
+  userId: number,
+  userCountry: string | null
+): ClaimResult {
+  const seat = getSeatByCode(code);
+  if (!seat) {
+    return { ok: false, error: "Seat not found" };
+  }
+
+  if (seat.claimedByUserId !== null) {
+    return { ok: false, error: "This seat has already been claimed" };
+  }
+
+  if (isUserEnrolled(userId, seat.courseId)) {
+    return { ok: false, error: "You are already enrolled in this course" };
+  }
+
+  if (isSeatPppLocked(seat, userCountry)) {
     return {
       ok: false,
       error:
-        "This coupon can only be redeemed from the same country as the purchaser",
+        "This seat can only be claimed from the country it was bought in",
     };
   }
 
-  db.update(coupons)
+  db.update(seats)
     .set({
-      redeemedByUserId: userId,
-      redeemedAt: new Date().toISOString(),
+      claimedByUserId: userId,
+      claimedAt: new Date().toISOString(),
     })
-    .where(eq(coupons.id, coupon.id))
+    .where(eq(seats.id, seat.id))
     .run();
 
   const enrollment = db
     .insert(enrollments)
-    .values({ userId, courseId: coupon.courseId })
+    .values({ userId, courseId: seat.courseId })
     .returning()
     .get();
 
   return { ok: true, enrollment };
 }
 
-const redeemParamsSchema = z.object({
+const claimParamsSchema = z.object({
   code: z.string().min(1),
 });
 
-const redeemActionSchema = z.object({
-  intent: z.literal("confirm-redeem"),
+const claimActionSchema = z.object({
+  intent: z.literal("confirm-claim"),
 });
 
 export function meta({ loaderData }: Route.MetaArgs) {
-  const title = loaderData?.course?.title ?? "Redeem Coupon";
+  const title = loaderData?.course?.title ?? "Claim Seat";
   return [
-    { title: `Redeem: ${title} — Cadence` },
-    { name: "description", content: `Redeem your coupon for ${title}` },
+    { title: `Claim a seat: ${title} — Cadence` },
+    { name: "description", content: `Claim your seat in ${title}` },
   ];
 }
 
 export async function loader({ params, request }: Route.LoaderArgs) {
-  const { code } = parseParams(params, redeemParamsSchema);
+  const { code } = parseParams(params, claimParamsSchema);
 
-  const coupon = getCouponByCode(code);
-  if (!coupon) {
-    throw data("Coupon not found.", { status: 404 });
+  const seat = getSeatByCode(code);
+  if (!seat) {
+    throw data("Seat not found.", { status: 404 });
   }
 
   const currentUserId = await getCurrentUserId(request);
   if (!currentUserId) {
     throw redirect(
-      `/login?redirectTo=${encodeURIComponent(`/redeem/${code}`)}`
+      `/login?redirectTo=${encodeURIComponent(`/claim/${code}`)}`
     );
   }
 
-  const course = getCourseById(coupon.courseId);
+  const course = getCourseById(seat.courseId);
   if (!course) {
     throw data("Course not found.", { status: 404 });
   }
 
-  const alreadyRedeemed = coupon.redeemedByUserId !== null;
-  const alreadyEnrolled = isUserEnrolled(currentUserId, coupon.courseId);
+  const alreadyClaimed = seat.claimedByUserId !== null;
+  const alreadyEnrolled = isUserEnrolled(currentUserId, seat.courseId);
 
   // Check country mismatch upfront so we can show a clear message
-  let countryMismatch = false;
-  if (!alreadyRedeemed && !alreadyEnrolled) {
-    const userCountry = await resolveCountry(request);
-    const purchase = db
-      .select()
-      .from(purchases)
-      .where(eq(purchases.id, coupon.purchaseId))
-      .get();
-    if (purchase?.country && purchase.country !== (userCountry ?? "")) {
-      countryMismatch = true;
-    }
-  }
+  const pppLocked =
+    !alreadyClaimed &&
+    !alreadyEnrolled &&
+    isSeatPppLocked(seat, await resolveCountry(request));
 
   return {
     course: { id: course.id, title: course.title, slug: course.slug },
     code,
-    alreadyRedeemed,
+    alreadyClaimed,
     alreadyEnrolled,
-    countryMismatch,
+    pppLocked,
   };
 }
 
 export async function action({ params, request }: Route.ActionArgs) {
-  const { code } = parseParams(params, redeemParamsSchema);
+  const { code } = parseParams(params, claimParamsSchema);
 
   const currentUserId = await getCurrentUserId(request);
   if (!currentUserId) {
@@ -169,14 +169,14 @@ export async function action({ params, request }: Route.ActionArgs) {
   }
 
   const formData = await request.formData();
-  const parsed = parseFormData(formData, redeemActionSchema);
+  const parsed = parseFormData(formData, claimActionSchema);
 
   if (!parsed.success) {
     throw data("Invalid action.", { status: 400 });
   }
 
   const userCountry = await resolveCountry(request);
-  const result = redeemCoupon(code, currentUserId, userCountry ?? "");
+  const result = claimSeat(code, currentUserId, userCountry);
 
   if (!result.ok) {
     return data({ error: result.error }, { status: 400 });
@@ -190,11 +190,11 @@ export async function action({ params, request }: Route.ActionArgs) {
   throw redirect(`/courses/${course.slug}/welcome`);
 }
 
-export default function Redeem({
+export default function ClaimSeat({
   loaderData,
   actionData,
 }: Route.ComponentProps) {
-  const { course, code, alreadyRedeemed, alreadyEnrolled, countryMismatch } =
+  const { course, code, alreadyClaimed, alreadyEnrolled, pppLocked } =
     loaderData;
   const fetcher = useFetcher();
   const isSubmitting = fetcher.state !== "idle";
@@ -207,12 +207,10 @@ export default function Redeem({
     }
   }, [fetcher.data, actionData]);
 
-  // Determine which state to show
-  const canRedeem = !alreadyRedeemed && !alreadyEnrolled && !countryMismatch;
 
   return (
     <div className="mx-auto max-w-2xl p-6 lg:p-8">
-      <h1 className="mb-2 text-2xl font-bold">Redeem Coupon</h1>
+      <h1 className="mb-2 text-2xl font-bold">Claim Your Seat</h1>
       <p className="mb-8 text-muted-foreground">
         You&apos;ve been invited to enroll in a course.
       </p>
@@ -225,21 +223,21 @@ export default function Redeem({
 
           <h2 className="mb-2 text-xl font-semibold">{course.title}</h2>
           <p className="mb-6 text-sm text-muted-foreground">
-            Coupon code:{" "}
+            Seat code:{" "}
             <code className="rounded bg-muted px-2 py-0.5">{code}</code>
           </p>
 
-          {alreadyRedeemed ? (
+          {alreadyClaimed ? (
             <div className="rounded-lg bg-destructive/10 p-4">
               <div className="flex items-center justify-center gap-2 text-destructive">
                 <AlertCircle className="size-5" />
                 <span className="font-medium">
-                  This coupon has already been used
+                  This seat has already been claimed
                 </span>
               </div>
               <p className="mt-2 text-sm text-muted-foreground">
                 Someone has already claimed this seat. Please ask the person who
-                shared this link for a new coupon.
+                shared this link for another one.
               </p>
             </div>
           ) : alreadyEnrolled ? (
@@ -251,8 +249,8 @@ export default function Redeem({
                 </span>
               </div>
               <p className="mt-2 text-sm text-muted-foreground">
-                You already have access to this course. The coupon has not been
-                used, so it can still be shared with someone else.
+                You already have access to this course. The seat has not been
+                claimed, so it can still be shared with someone else.
               </p>
               <Link to={`/courses/${course.slug}`}>
                 <Button className="mt-4" size="lg">
@@ -260,27 +258,26 @@ export default function Redeem({
                 </Button>
               </Link>
             </div>
-          ) : countryMismatch ? (
+          ) : pppLocked ? (
             <div className="rounded-lg bg-amber-50 p-4 dark:bg-amber-900/20">
               <div className="flex items-center justify-center gap-2 text-amber-700 dark:text-amber-400">
                 <Globe className="size-5" />
                 <span className="font-medium">Region restriction</span>
               </div>
               <p className="mt-2 text-sm text-muted-foreground">
-                This coupon can only be redeemed from the same country as the
-                person who purchased it. Your location doesn&apos;t match the
-                purchaser&apos;s country.
+                This seat was bought at a regional (PPP) price, so it can only
+                be claimed from the country it was bought in.
               </p>
             </div>
           ) : (
             <fetcher.Form method="post">
-              <input type="hidden" name="intent" value="confirm-redeem" />
+              <input type="hidden" name="intent" value="confirm-claim" />
               <Button
                 size="lg"
                 className="w-full max-w-sm"
                 disabled={isSubmitting}
               >
-                {isSubmitting ? "Enrolling..." : "Enroll Now"}
+                {isSubmitting ? "Claiming..." : "Claim Seat"}
               </Button>
             </fetcher.Form>
           )}

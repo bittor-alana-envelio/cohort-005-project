@@ -26,7 +26,7 @@ import {
   comments,
   courseRatings,
   courses,
-  coupons,
+  seats,
   enrollments,
   lessonProgress,
   lessons,
@@ -34,6 +34,7 @@ import {
   purchases,
   quizAttempts,
   quizzes,
+  refundRequests,
   users,
 } from "~/db/schema";
 import { splitRevenue, type AnalyticsRange } from "~/lib/analytics";
@@ -82,8 +83,8 @@ import { AlertTriangle, Rocket } from "lucide-react";
 type AnalyticsTab = "overview" | "course";
 
 const chartConfig = {
-  grossCents: { label: "Gross revenue", color: "var(--chart-1)" },
-  netCents: { label: "Net earnings", color: "var(--chart-2)" },
+  revenueCents: { label: "Revenue", color: "var(--chart-1)" },
+  earningsCents: { label: "Earnings", color: "var(--chart-2)" },
 } satisfies ChartConfig;
 
 export function meta() {
@@ -100,16 +101,17 @@ function parseId(value: string | null): number | null {
 }
 
 type RevenueSummary = {
-  grossCents: number;
+  revenueCents: number;
   feeCents: number;
-  netCents: number;
+  refundedCents: number;
+  earningsCents: number;
   purchaseCount: number;
 };
 
 type RevenuePoint = {
   bucket: string;
-  grossCents: number;
-  netCents: number;
+  revenueCents: number;
+  earningsCents: number;
 };
 
 type RevenueSeries = {
@@ -130,7 +132,7 @@ type TopBuyer = {
   spendCents: number;
   purchaseCount: number;
   seatsBought: number;
-  seatsUnredeemed: number;
+  seatsUnclaimed: number;
   enrolled: boolean;
 };
 
@@ -181,19 +183,19 @@ type QuizPassRate = {
 type CountryRevenueRow = {
   country: string | null;
   purchaseCount: number;
-  grossCents: number;
-  netCents: number;
+  revenueCents: number;
+  earningsCents: number;
   sharePercent: number;
   averagePaidCents: number;
   discountPercent: number | null;
 };
 
 type CourseCountryRevenue = {
-  grossCents: number;
-  netCents: number;
+  revenueCents: number;
+  earningsCents: number;
   purchaseCount: number;
-  discountedGrossCents: number;
-  discountedNetCents: number;
+  discountedRevenueCents: number;
+  discountedEarningsCents: number;
   discountedSharePercent: number;
   rows: CountryRevenueRow[];
 };
@@ -249,11 +251,11 @@ function getStudentRevenue(
 
   const studentIds = students.map((student) => student.userId);
 
-  // Correlated: did this purchase mint seats for other people?
-  const mintedSeats = db
+  // Correlated: did this purchase buy seats for other people?
+  const boughtSeats = db
     .select({ one: sql`1` })
-    .from(coupons)
-    .where(eq(coupons.purchaseId, purchases.id));
+    .from(seats)
+    .where(eq(seats.purchaseId, purchases.id));
 
   const direct = db
     .select({ userId: purchases.userId, paid: sum(purchases.amountPaid) })
@@ -262,7 +264,7 @@ function getStudentRevenue(
     .where(
       and(
         inArray(purchases.userId, studentIds),
-        notExists(mintedSeats),
+        notExists(boughtSeats),
         ownedBy(instructorId)
       )
     )
@@ -270,26 +272,26 @@ function getStudentRevenue(
     .all();
 
   const seatCounts = db
-    .select({ purchaseId: coupons.purchaseId, seats: count().as("seats") })
-    .from(coupons)
-    .groupBy(coupons.purchaseId)
+    .select({ purchaseId: seats.purchaseId, seats: count().as("seats") })
+    .from(seats)
+    .groupBy(seats.purchaseId)
     .as("seat_counts");
 
   const viaSeat = db
     .select({
-      userId: coupons.redeemedByUserId,
+      userId: seats.claimedByUserId,
       // Divided rather than rounded per row: the shares are summed first and
       // rounded once, so five seats out of 3333 cents still add up.
       paid: sql<number>`sum(${purchases.amountPaid} * 1.0 / ${seatCounts.seats})`,
     })
-    .from(coupons)
-    .innerJoin(purchases, eq(coupons.purchaseId, purchases.id))
+    .from(seats)
+    .innerJoin(purchases, eq(seats.purchaseId, purchases.id))
     .innerJoin(courses, eq(purchases.courseId, courses.id))
-    .innerJoin(seatCounts, eq(seatCounts.purchaseId, coupons.purchaseId))
+    .innerJoin(seatCounts, eq(seatCounts.purchaseId, seats.purchaseId))
     .where(
-      and(inArray(coupons.redeemedByUserId, studentIds), ownedBy(instructorId))
+      and(inArray(seats.claimedByUserId, studentIds), ownedBy(instructorId))
     )
-    .groupBy(coupons.redeemedByUserId)
+    .groupBy(seats.claimedByUserId)
     .all();
 
   const paidByUser = new Map<number, number>();
@@ -334,17 +336,17 @@ function getTopBuyers(
 
   const buyerIds = buyers.map((buyer) => buyer.userId);
 
-  // Seats are counted in their own query: joining coupons to purchases above
+  // Seats are counted in their own query: joining seats to purchases above
   // would repeat each purchase once per seat and multiply the spend the
   // leaderboard ranks on.
-  const seats = db
+  const seatCountsByBuyer = db
     .select({
       userId: purchases.userId,
-      bought: count(coupons.id),
-      unredeemed: sql<number>`sum(case when ${coupons.redeemedByUserId} is null then 1 else 0 end)`,
+      bought: count(seats.id),
+      unclaimed: sql<number>`sum(case when ${seats.claimedByUserId} is null then 1 else 0 end)`,
     })
-    .from(coupons)
-    .innerJoin(purchases, eq(coupons.purchaseId, purchases.id))
+    .from(seats)
+    .innerJoin(purchases, eq(seats.purchaseId, purchases.id))
     .innerJoin(courses, eq(purchases.courseId, courses.id))
     .where(
       and(
@@ -355,7 +357,9 @@ function getTopBuyers(
     .groupBy(purchases.userId)
     .all();
 
-  const seatsByUser = new Map(seats.map((row) => [row.userId, row]));
+  const seatsByUser = new Map(
+    seatCountsByBuyer.map((row) => [row.userId, row])
+  );
 
   // No range here: "never enrolled" is a fact about the person, not about the
   // last thirty days.
@@ -376,7 +380,7 @@ function getTopBuyers(
     spendCents: Number(buyer.spend ?? 0),
     purchaseCount: buyer.purchaseCount,
     seatsBought: seatsByUser.get(buyer.userId)?.bought ?? 0,
-    seatsUnredeemed: Number(seatsByUser.get(buyer.userId)?.unredeemed ?? 0),
+    seatsUnclaimed: Number(seatsByUser.get(buyer.userId)?.unclaimed ?? 0),
     enrolled: enrolled.has(buyer.userId),
   }));
 }
@@ -440,9 +444,14 @@ function getRevenueOverTime(
   })`;
 
   const rows = db
-    .select({ bucket: bucketExpr, gross: sum(purchases.amountPaid) })
+    .select({
+      bucket: bucketExpr,
+      revenue: sum(purchases.amountPaid),
+      refunded: sum(refundRequests.amountRefunded),
+    })
     .from(purchases)
     .innerJoin(courses, eq(purchases.courseId, courses.id))
+    .leftJoin(refundRequests, eq(refundRequests.purchaseId, purchases.id))
     .where(purchaseScope(instructorId, range))
     .groupBy(bucketExpr)
     .orderBy(bucketExpr)
@@ -450,8 +459,11 @@ function getRevenueOverTime(
 
   if (rows.length === 0 && range === "all") return { granularity, points: [] };
 
-  const grossByBucket = new Map(
-    rows.map((row) => [row.bucket, Number(row.gross ?? 0)])
+  const byBucket = new Map(
+    rows.map((row) => [
+      row.bucket,
+      { revenue: Number(row.revenue ?? 0), refunded: Number(row.refunded ?? 0) },
+    ])
   );
 
   const now = new Date().toISOString();
@@ -464,10 +476,12 @@ function getRevenueOverTime(
     bucketOf(now, granularity),
     granularity
   ).map((bucket) => {
-    const { grossCents, netCents } = splitRevenue(
-      grossByBucket.get(bucket) ?? 0
+    const amounts = byBucket.get(bucket);
+    const { revenueCents, earningsCents } = splitRevenue(
+      amounts?.revenue ?? 0,
+      amounts?.refunded ?? 0
     );
-    return { bucket, grossCents, netCents };
+    return { bucket, revenueCents, earningsCents };
   });
 
   return { granularity, points };
@@ -736,10 +750,12 @@ function getCourseRevenueByCountry(
   const rows = db
     .select({
       country: purchases.country,
-      gross: sum(purchases.amountPaid),
+      revenue: sum(purchases.amountPaid),
+      refunded: sum(refundRequests.amountRefunded),
       purchaseCount: count(purchases.id),
     })
     .from(purchases)
+    .leftJoin(refundRequests, eq(refundRequests.purchaseId, purchases.id))
     .where(
       and(
         eq(purchases.courseId, courseId),
@@ -750,46 +766,57 @@ function getCourseRevenueByCountry(
     .all()
     .map((row) => ({
       country: row.country,
-      grossCents: Number(row.gross ?? 0),
+      revenueCents: Number(row.revenue ?? 0),
+      refundedCents: Number(row.refunded ?? 0),
       purchaseCount: row.purchaseCount,
     }))
-    .sort((a, b) => b.grossCents - a.grossCents);
+    .sort((a, b) => b.revenueCents - a.revenueCents);
 
-  const grossCents = rows.reduce((total, row) => total + row.grossCents, 0);
+  const revenueCents = rows.reduce((total, row) => total + row.revenueCents, 0);
+  const refundedCents = rows.reduce(
+    (total, row) => total + row.refundedCents,
+    0
+  );
   const purchaseCount = rows.reduce(
     (total, row) => total + row.purchaseCount,
     0
   );
 
   const share = (cents: number) =>
-    grossCents === 0 ? 0 : Math.round((cents / grossCents) * 100);
+    revenueCents === 0 ? 0 : Math.round((cents / revenueCents) * 100);
 
-  let discountedGrossCents = 0;
+  let discountedRevenueCents = 0;
+  let discountedRefundedCents = 0;
 
   const breakdown = rows.map((row) => {
     const discountPercent =
       row.country === null ? null : getDiscountForCountry(row.country) * 100;
 
     if (discountPercent !== null && discountPercent > 0) {
-      discountedGrossCents += row.grossCents;
+      discountedRevenueCents += row.revenueCents;
+      discountedRefundedCents += row.refundedCents;
     }
 
     return {
       ...row,
-      netCents: splitRevenue(row.grossCents).netCents,
-      sharePercent: share(row.grossCents),
-      averagePaidCents: Math.round(row.grossCents / row.purchaseCount),
+      earningsCents: splitRevenue(row.revenueCents, row.refundedCents)
+        .earningsCents,
+      sharePercent: share(row.revenueCents),
+      averagePaidCents: Math.round(row.revenueCents / row.purchaseCount),
       discountPercent,
     };
   });
 
   return {
-    grossCents,
-    netCents: splitRevenue(grossCents).netCents,
+    revenueCents,
+    earningsCents: splitRevenue(revenueCents, refundedCents).earningsCents,
     purchaseCount,
-    discountedGrossCents,
-    discountedNetCents: splitRevenue(discountedGrossCents).netCents,
-    discountedSharePercent: share(discountedGrossCents),
+    discountedRevenueCents,
+    discountedEarningsCents: splitRevenue(
+      discountedRevenueCents,
+      discountedRefundedCents
+    ).earningsCents,
+    discountedSharePercent: share(discountedRevenueCents),
     rows: breakdown,
   };
 }
@@ -885,20 +912,25 @@ export async function loader({ request, url }: Route.LoaderArgs) {
     older: (questionRow?.total ?? 0) - questionsInRange,
   };
 
-  // Gross revenue, the platform's fee and the instructor's net for the range.
+  // Revenue, the Platform Fee, Refunds and Earnings for the range.
   const summaryRow = db
     .select({
-      gross: sum(purchases.amountPaid),
+      revenue: sum(purchases.amountPaid),
+      refunded: sum(refundRequests.amountRefunded),
       purchaseCount: count(purchases.id),
     })
     .from(purchases)
     .innerJoin(courses, eq(purchases.courseId, courses.id))
+    .leftJoin(refundRequests, eq(refundRequests.purchaseId, purchases.id))
     .where(purchaseScope(instructorId, range))
     .get();
 
   // sum() returns null over an empty set, and a string when SQLite has rows.
   const summary: RevenueSummary = {
-    ...splitRevenue(Number(summaryRow?.gross ?? 0)),
+    ...splitRevenue(
+      Number(summaryRow?.revenue ?? 0),
+      Number(summaryRow?.refunded ?? 0)
+    ),
     purchaseCount: summaryRow?.purchaseCount ?? 0,
   };
 
@@ -908,11 +940,13 @@ export async function loader({ request, url }: Route.LoaderArgs) {
     .select({
       courseId: courses.id,
       title: courses.title,
-      gross: sum(purchases.amountPaid),
+      revenue: sum(purchases.amountPaid),
+      refunded: sum(refundRequests.amountRefunded),
       purchaseCount: count(purchases.id),
     })
     .from(purchases)
     .innerJoin(courses, eq(purchases.courseId, courses.id))
+    .leftJoin(refundRequests, eq(refundRequests.purchaseId, purchases.id))
     .where(purchaseScope(instructorId, range))
     .groupBy(courses.id)
     .all();
@@ -921,10 +955,10 @@ export async function loader({ request, url }: Route.LoaderArgs) {
     .map((row) => ({
       courseId: row.courseId,
       title: row.title,
-      ...splitRevenue(Number(row.gross ?? 0)),
+      ...splitRevenue(Number(row.revenue ?? 0), Number(row.refunded ?? 0)),
       purchaseCount: row.purchaseCount,
     }))
-    .sort((a, b) => b.grossCents - a.grossCents);
+    .sort((a, b) => b.revenueCents - a.revenueCents);
 
   // How many people paid, and how many are learning. Deliberately two numbers:
   // one team purchase is a single buyer covering several seats, and someone who
@@ -1132,11 +1166,11 @@ function TopBuyers({
                   </span>{" "}
                   <span className="text-xs text-muted-foreground">
                     bought {buyer.seatsBought},{" "}
-                    {buyer.seatsUnredeemed > 0 ? (
+                    {buyer.seatsUnclaimed > 0 ? (
                       // The prompt to chase: seats paid for that nobody is
                       // using are the most actionable thing on this table.
                       <span className="font-medium text-foreground">
-                        {buyer.seatsUnredeemed} unused
+                        {buyer.seatsUnclaimed} unused
                       </span>
                     ) : (
                       "all claimed"
@@ -1202,17 +1236,17 @@ function RevenueChart({ series }: { series: RevenueSeries }) {
           }
         />
         <Area
-          dataKey="grossCents"
+          dataKey="revenueCents"
           type="monotone"
-          stroke="var(--color-grossCents)"
-          fill="var(--color-grossCents)"
+          stroke="var(--color-revenueCents)"
+          fill="var(--color-revenueCents)"
           fillOpacity={0.2}
         />
         <Area
-          dataKey="netCents"
+          dataKey="earningsCents"
           type="monotone"
-          stroke="var(--color-netCents)"
-          fill="var(--color-netCents)"
+          stroke="var(--color-earningsCents)"
+          fill="var(--color-earningsCents)"
           fillOpacity={0.2}
         />
       </AreaChart>
@@ -1438,8 +1472,8 @@ function RevenueByCountry({ breakdown }: { breakdown: CourseCountryRevenue }) {
         {/* The headline the panel exists for: parity discounting is otherwise
             invisible, though it directly sets what the instructor earns — so
             the figure is stated in net, the money they actually keep. */}
-        {formatMoney(breakdown.discountedNetCents)} of your{" "}
-        {formatMoney(breakdown.netCents)} net earnings (
+        {formatMoney(breakdown.discountedEarningsCents)} of your{" "}
+        {formatMoney(breakdown.earningsCents)} earnings (
         {breakdown.discountedSharePercent}%) came from countries with a parity
         discount. Averages are what a sale there actually fetched — list prices
         change and are not kept, so no discount is reconstructed per purchase.
@@ -1450,8 +1484,8 @@ function RevenueByCountry({ breakdown }: { breakdown: CourseCountryRevenue }) {
             <th className="pb-2 font-medium">Country</th>
             <th className="pb-2 text-right font-medium">Sales</th>
             <th className="pb-2 text-right font-medium">Average paid</th>
-            <th className="pb-2 text-right font-medium">Gross</th>
-            <th className="pb-2 text-right font-medium">Net</th>
+            <th className="pb-2 text-right font-medium">Revenue</th>
+            <th className="pb-2 text-right font-medium">Earnings</th>
             <th className="pb-2 text-right font-medium">Share</th>
           </tr>
         </thead>
@@ -1477,10 +1511,10 @@ function RevenueByCountry({ breakdown }: { breakdown: CourseCountryRevenue }) {
                 {formatMoney(row.averagePaidCents)}
               </td>
               <td className="py-3 text-right tabular-nums">
-                {formatMoney(row.grossCents)}
+                {formatMoney(row.revenueCents)}
               </td>
               <td className="py-3 text-right font-medium tabular-nums">
-                {formatMoney(row.netCents)}
+                {formatMoney(row.earningsCents)}
               </td>
               <td className="py-3 text-right tabular-nums">
                 <span className="mr-2">{row.sharePercent}%</span>
@@ -1633,8 +1667,8 @@ export default function InstructorAnalytics({
           <TabsContent value="overview" className="space-y-6">
             <div className="grid gap-4 sm:grid-cols-3">
               <MoneyCard
-                label="Gross revenue"
-                amountCents={summary.grossCents}
+                label="Revenue"
+                amountCents={summary.revenueCents}
                 hint={`What students paid, across ${summary.purchaseCount} ${
                   summary.purchaseCount === 1 ? "purchase" : "purchases"
                 }.`}
@@ -1645,9 +1679,13 @@ export default function InstructorAnalytics({
                 hint="Cadence's cut. Already deducted from your earnings."
               />
               <MoneyCard
-                label="Your net earnings"
-                amountCents={summary.netCents}
-                hint="What you keep — gross revenue minus the platform fee."
+                label="Your earnings"
+                amountCents={summary.earningsCents}
+                hint={`What you keep — Revenue minus the platform fee${
+                  summary.refundedCents > 0
+                    ? ` and ${formatMoney(summary.refundedCents)} in refunds`
+                    : " and refunds"
+                }.`}
                 emphasis
               />
             </div>
@@ -1662,7 +1700,7 @@ export default function InstructorAnalytics({
               <StatCard
                 label="Enrolled students"
                 value={audience.studentCount}
-                hint={`Learners with access, seats included.${
+                hint={`Students with access, seats included.${
                   audience.revenuePerStudentCents === null
                     ? ""
                     : ` ${formatMoney(
@@ -1848,11 +1886,11 @@ export default function InstructorAnalytics({
                       <tr className="border-b text-left text-muted-foreground">
                         <th className="pb-2 font-medium">Course</th>
                         <th className="pb-2 text-right font-medium">Sales</th>
-                        <th className="pb-2 text-right font-medium">Gross</th>
+                        <th className="pb-2 text-right font-medium">Revenue</th>
                         <th className="pb-2 text-right font-medium">
                           Fee ({PLATFORM_FEE_PERCENT}%)
                         </th>
-                        <th className="pb-2 text-right font-medium">Net</th>
+                        <th className="pb-2 text-right font-medium">Earnings</th>
                       </tr>
                     </thead>
                     <tbody>
@@ -1863,13 +1901,13 @@ export default function InstructorAnalytics({
                             {course.purchaseCount}
                           </td>
                           <td className="py-3 text-right tabular-nums">
-                            {formatMoney(course.grossCents)}
+                            {formatMoney(course.revenueCents)}
                           </td>
                           <td className="py-3 text-right tabular-nums text-muted-foreground">
                             {formatMoney(course.feeCents)}
                           </td>
                           <td className="py-3 text-right font-medium tabular-nums">
-                            {formatMoney(course.netCents)}
+                            {formatMoney(course.earningsCents)}
                           </td>
                         </tr>
                       ))}

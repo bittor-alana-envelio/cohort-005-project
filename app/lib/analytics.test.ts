@@ -52,28 +52,40 @@ describe("analytics config", () => {
   });
 
   describe("splitRevenue", () => {
-    it("splits a round amount into fee and net", () => {
+    it("splits Revenue into the Platform Fee and Earnings", () => {
       expect(splitRevenue(10000)).toEqual({
-        grossCents: 10000,
+        revenueCents: 10000,
         feeCents: 2000,
-        netCents: 8000,
+        refundedCents: 0,
+        earningsCents: 8000,
       });
     });
 
-    it("keeps fee and net adding up to gross when the split is fractional", () => {
+    it("keeps fee and Earnings adding up to Revenue when the split is fractional", () => {
       // Half a cent each way — the amounts where rounding both figures
       // independently leaves the page a cent short.
-      for (const gross of [1, 3, 7, 3333, 99_999]) {
-        const { feeCents, netCents } = splitRevenue(gross);
-        expect(feeCents + netCents).toBe(gross);
+      for (const revenue of [1, 3, 7, 3333, 99_999]) {
+        const { feeCents, earningsCents } = splitRevenue(revenue);
+        expect(feeCents + earningsCents).toBe(revenue);
       }
+    });
+
+    it("takes Refunds out of Earnings, not out of the Platform Fee", () => {
+      // GLOSSARY.md: Earnings are Revenue minus the Platform Fee minus Refunds.
+      expect(splitRevenue(10000, 3000)).toEqual({
+        revenueCents: 10000,
+        feeCents: 2000,
+        refundedCents: 3000,
+        earningsCents: 5000,
+      });
     });
 
     it("splits zero into zeroes", () => {
       expect(splitRevenue(0)).toEqual({
-        grossCents: 0,
+        revenueCents: 0,
         feeCents: 0,
-        netCents: 0,
+        refundedCents: 0,
+        earningsCents: 0,
       });
     });
   });
